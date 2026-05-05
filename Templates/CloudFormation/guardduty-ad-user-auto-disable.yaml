@@ -1,0 +1,421 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description:
+  AWS CloudFormation template to automatically disable Active Directory users
+  when GuardDuty detects suspicious activity using Step Functions, EventBridge,
+  and Systems Manager automation.
+Parameters:
+  DirectoryID:
+    Type: String
+    Description: The AWS Managed Microsoft AD Directory ID where users will be disabled
+    AllowedPattern: ^d-[0-9a-f]{10}$
+    ConstraintDescription: "Must be a valid Directory Service directory ID (format: d-xxxxxxxxxx)"
+  NotificationEmail:
+    Type: String
+    Description: Email address for notifications when users are disabled
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+Resources:
+  GuardDutyStateMachineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: StepFunctionExec
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${LinuxUsernameExtractionDocument}
+                  - !Sub arn:${AWS::Partition}:ec2:*:*:instance/*
+              - Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents                  
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${ActiveDirectoryUserDisableDocument}:$DEFAULT
+              - Action: iam:PassRole
+                Resource: !GetAtt AWSSystemsManagerAutomationExecutionRole.Arn
+                Effect: Allow
+      Tags:
+        - Key: cloudformation:logical-id
+          Value: GuardDutyStateMachineExecutionRole
+        - Key: cloudformation:stack-id
+          Value: !Ref AWS::StackId
+        - Key: cloudformation:stack-name
+          Value: !Ref AWS::StackName
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      KmsKeyId: !GetAtt KmsEncryptionKey.Arn
+      RetentionInDays: 30
+  GuardDutyUserDisableStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineType: EXPRESS
+      RoleArn: !GetAtt GuardDutyStateMachineExecutionRole.Arn
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+        IncludeExecutionData: True
+        Level: ALL
+      Definition:
+        Comment: >-
+          Step Function initiated by GuardDuty by EventBridge to find Linux user
+          and disable in Active Directory
+        StartAt: Choice
+        States:
+          Choice:
+            Type: Choice
+            Choices:
+              - Variable: $.detail.service.runtimeDetails.process.euid
+                IsPresent: true
+                Next: Find Username
+            Default: No UserID found
+          Find Username:
+            Type: Task
+            Parameters:
+              DocumentName: !Ref LinuxUsernameExtractionDocument
+              Parameters:
+                UserId.$: >-
+                  States.Array(States.JsonToString($.detail.service.runtimeDetails.process.euid))
+              Targets:
+                - Key: InstanceIds
+                  Values.$: States.Array($.detail.resource.instanceDetails.instanceId)
+            Resource: arn:aws:states:::aws-sdk:ssm:sendCommand
+            Next: Wait
+            ResultPath: $.RunCommand.State
+          Wait:
+            Type: Wait
+            Seconds: 5
+            Next: Get Username
+          Get Username:
+            Type: Task
+            Parameters:
+              CommandId.$: $.RunCommand.State.Command.CommandId
+              InstanceId.$: $.detail.resource.instanceDetails.instanceId
+            Resource: arn:aws:states:::aws-sdk:ssm:getCommandInvocation
+            ResultSelector:
+              StandardOutputContent.$: |-
+                States.ArrayGetItem(States.StringSplit($.StandardOutputContent,''), 0)
+            Next: StartAutomationExecution
+          StartAutomationExecution:
+            Type: Task
+            Parameters:
+              DocumentName: !Ref ActiveDirectoryUserDisableDocument
+              Parameters:
+                UserName.$: States.Array($.StandardOutputContent)
+            Resource: arn:aws:states:::aws-sdk:ssm:startAutomationExecution
+            End: true
+          No UserID found:
+            Type: Pass
+            End: true
+  GuardDutyMaliciousActivityRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Ref GuardDutyUserDisableStateMachine
+          PolicyName: StartStateMachinePolicy
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt GuardDutyStateMachineExecutionRole.Arn
+          PolicyName: StateMachinePassRolePolicy
+      Tags:
+        - Key: cloudformation:logical-id
+          Value: GuardDutyMaliciousActivityRuleRole
+        - Key: cloudformation:stack-id
+          Value: !Ref AWS::StackId
+        - Key: cloudformation:stack-name
+          Value: !Ref AWS::StackName
+  GuardDutyMaliciousActivityRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Amazon EventBridge rule for each run command invocation. This is created as a part of a CloudFormation.
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+        detail:
+          type:
+            - "Backdoor:Runtime/C&CActivity.B!DNS"
+      Targets:
+        - Arn: !Ref GuardDutyUserDisableStateMachine
+          Id: GuardDutyMaliciousActivityRuleRole
+          RoleArn: !GetAtt GuardDutyMaliciousActivityRuleRole.Arn
+  LinuxUsernameExtractionDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Content:
+        schemaVersion: "2.2"
+        description: "Get Username from Linux."
+        parameters:
+          UserId:
+            type: String
+            description: "(Required) The User ID to find."
+            default: "1000"
+        mainSteps:
+          - action: aws:runShellScript
+            name: GetLinuxUsername
+            precondition:
+              StringEquals:
+                - platformType
+                - Linux
+            inputs:
+              timeoutSeconds: 7200
+              runCommand:
+                - |
+                  username=$(id -nu {{ UserId }})
+                  case "$username" in
+                    *@*)
+                      printf '%s' "${username%@*}"
+                      ;;
+                    *\\*)
+                      printf '%s' "${username##*\\}"
+                      ;;
+                    *)
+                      printf '%s' "$username"
+                      ;;
+                  esac
+            outputs:
+              - Name: output
+                Selector: $.Payload.output
+                Type: String
+      DocumentFormat: YAML
+      DocumentType: Command
+  AWSSystemsManagerAutomationExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole"
+      Path: /
+      Policies:
+        - PolicyName: ExecutionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ds-data:DisableUser
+                  - ds:AccessDSData
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ds:${AWS::Region}:${AWS::AccountId}:directory/${DirectoryID}
+      Tags:
+        - Key: cloudformation:logical-id
+          Value: AWSSystemsManagerAutomationExecutionRole
+        - Key: cloudformation:stack-id
+          Value: !Ref AWS::StackId
+        - Key: cloudformation:stack-name
+          Value: !Ref AWS::StackName
+  ActiveDirectoryUserDisableDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentFormat: YAML
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        description: "Disable a user in AWS Managed Microsoft AD"
+        assumeRole: "{{ AutomationAssumeRole }}"
+        parameters:
+          UserName:
+            type: String
+            description: "The username to disable"
+          DirectoryId:
+            type: String
+            description: "The directory ID where the user exists"
+            default: !Ref DirectoryID
+          AutomationAssumeRole:
+            type: String
+            description: "IAM role for automation execution"
+            default: !GetAtt AWSSystemsManagerAutomationExecutionRole.Arn
+        mainSteps:
+          - name: DisableUser
+            action: aws:executeAwsApi
+            inputs:
+              Service: ds-data
+              Api: disable_user
+              DirectoryId: "{{ DirectoryId }}"
+              SAMAccountName: "{{ UserName }}"
+  KmsEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for SNS Topic encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow SNS to use the key
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs to use the key
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+      Tags:
+        - Key: cloudformation:logical-id
+          Value: KmsEncryptionKey
+        - Key: cloudformation:stack-id
+          Value: !Ref AWS::StackId
+        - Key: cloudformation:stack-name
+          Value: !Ref AWS::StackName     
+  UserDisableNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: AD User Disable Notifications
+      KmsMasterKeyId: !Ref KmsEncryptionKey
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+  # IAM role for EventBridge to publish to SNS
+  DisableUserNotificationRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref UserDisableNotificationTopic
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !GetAtt KmsEncryptionKey.Arn                
+      Tags:
+        - Key: cloudformation:logical-id
+          Value: DisableUserNotificationRuleRole
+        - Key: cloudformation:stack-id
+          Value: !Ref AWS::StackId
+        - Key: cloudformation:stack-name
+          Value: !Ref AWS::StackName
+  # Update the EventBridge rule to use the IAM role
+  DisableUserNotificationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "EventBridge rule to notify when a user is disabled in Active Directory via CloudTrail"
+      EventPattern:
+        source:
+          - "aws.ds"
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - "ds.amazonaws.com"
+          eventName:
+            - "DisableUser"
+      State: ENABLED
+      Targets:
+        - Arn: !Ref UserDisableNotificationTopic
+          Id: "DisableUserSNSTarget"
+          RoleArn: !GetAtt DisableUserNotificationRuleRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              username: "$.detail.requestParameters.sAMAccountName"
+              directoryId: "$.detail.requestParameters.directoryId"
+              sourceIP: "$.detail.sourceIPAddress"
+              userIdentity: "$.detail.userIdentity.type"
+              eventTime: "$.detail.eventTime"
+              fullEvent: "$"
+            InputTemplate: |
+              {
+                "alert": "🚨 Active Directory User Disabled",
+                "summary": {
+                  "username": "<username>",
+                  "directoryId": "<directoryId>",
+                  "sourceIP": "<sourceIP>",
+                  "triggeredBy": "<userIdentity>",
+                  "timestamp": "<eventTime>",
+                  "action": "User account has been automatically disabled due to security policy"
+                },
+                "fullEventDetails": <fullEvent>
+              }
