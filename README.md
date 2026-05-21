@@ -2,8 +2,6 @@
 
 This repo hosts the CloudFormation template accompanying the AWS Security Blog post "[Automating identity lifecycle and security with AWS Directory Service APIs](https://aws.amazon.com/blogs/security/automating-identity-lifecycle-and-security-with-aws-directory-service-apis/)" published on the [AWS Security Blog](https://aws.amazon.com/blogs/security/) channel.
 
-> TODO: Replace the post link above with the direct blog post URL once it is published.
-
 ## Overview
 This solution automatically disables an [AWS Managed Microsoft AD](https://docs.aws.amazon.com/directoryservice/latest/admin-guide/directory_microsoft_ad.html) user account when [Amazon GuardDuty](https://aws.amazon.com/guardduty/) detects suspicious runtime activity on an EC2 instance joined to the directory. It reduces the time between detection and containment by removing the human step of mapping a Linux process owner back to a directory identity. The solution helps you:
 - **Contain threats faster**: Disable the impacted user in Active Directory within seconds of a matching GuardDuty finding, without waiting for an on-call responder to investigate.
