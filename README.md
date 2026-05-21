@@ -1,6 +1,6 @@
 # Automatically Disable Active Directory Users on GuardDuty Findings
 
-This repo hosts the CloudFormation template accompanying the AWS Security Blog post "[Automating identity lifecycle and security with AWS Directory Service APIs](https://aws.amazon.com/blogs/security/)" published on the [AWS Security Blog](https://aws.amazon.com/blogs/security/) channel.
+This repo hosts the CloudFormation template accompanying the AWS Security Blog post "[Automating identity lifecycle and security with AWS Directory Service APIs](https://aws.amazon.com/blogs/security/automating-identity-lifecycle-and-security-with-aws-directory-service-apis/)" published on the [AWS Security Blog](https://aws.amazon.com/blogs/security/) channel.
 
 > TODO: Replace the post link above with the direct blog post URL once it is published.
 
